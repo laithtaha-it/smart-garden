@@ -1,0 +1,604 @@
+#include <WiFi.h>
+#include <WiFiManager.h>      // مكتبة WiFiManager
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ===== Firebase Realtime Database =====
+//Add your Firebase Realtime Database host here
+const char* firebaseHost = "";
+const char* deviceId = "esp01"; 
+
+// ===== إعدادات OpenWeather =====
+//Add your OpenWeather API key here
+const char* apiKey    = "";  // مفتاح OpenWeather
+const char* latitude  = "15.3528102";   // إحداثياتك
+const char* longitude = "44.2094892";
+
+// ===== إعدادات الحساسات =====
+#define SOIL_PIN   34   // حساس التربة (ADC)
+#define TRIG_PIN    5   // TRIG للـ Ultrasonic
+#define ECHO_PIN   18   // ECHO للـ Ultrasonic
+#define PUMP_PIN   23   // مدخل الريليه (Active LOW)
+
+// طول الخزان وهو فاضي بالكامل (سم)
+float tankHeightCm = 0;
+unsigned long lastTankHeightRead = 0;
+
+// ===== إعدادات الـ LCD =====
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ===== متغيرات الطقس =====
+bool   isRainExpected = false;
+float  forecastTemp   = 0;
+int    forecastHum    = 0;
+String forecastDesc   = "";
+
+// ===== متغيرات مراقبة الأنابيب والمضخة =====
+bool pipeError      = false;  // تهريب / قطع في الأنابيب
+bool pumpStuckError = false;  // مضخة عالقة
+
+String pumpCommand = "";
+bool remotePumpOn = false;
+bool lastPumpOn          = false;           // حالة المضخة في الدورة السابقة
+unsigned long pumpOnStartTime = 0;          // وقت بداية تشغيل المضخة
+int   soilAtPumpStart    = 0;               // قراءة التربة عند بداية التشغيل
+float waterAtPumpStart   = 0;               // نسبة الماء عند بداية التشغيل
+
+// إعدادات الكشف (تقدر تعدلها)
+const unsigned long PUMP_HEALTH_CHECK_TIME = 30000;   // 30 ثانية بعد تشغيل المضخة
+const float MIN_WATER_DROP_FOR_FLOW = 5.0;            // نزول أكبر من 5% = فيه جريان ماء
+const float MAX_WATER_DROP_FOR_STUCK = 1.0;           // نزول أقل من 1% = المضخة ما تسحب
+const int SOIL_DRY_THRESHOLD = 4000;                  // التربة فوق هذا الرقم = جافة تقريباً
+
+// تحديث الطقس كل 30 دقيقة
+unsigned long lastWeatherTime = 0;
+const unsigned long weatherInterval = 30UL * 60UL * 1000UL;
+
+// ===== أعلام لتنظيم الإشعارات =====
+bool rainSkipAlertSent      = false;  // عشان ما نكرر إشعار "تخطي الري بسبب المطر" كل ثانية
+bool lowWaterAlertSent      = false;  // عشان ما نكرر إشعار "الماء منخفض"
+bool irrigationInProgress   = false;  // دورة ري شغّالة حالياً (المضخة اشتغلت ولسه ما طفيناها)
+
+// -------------------------------------------------
+// قراءة طول الخزان من Firebase
+// -------------------------------------------------
+void readTankHeightFromFirebase() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = String(firebaseHost) +
+               "devices/" + deviceId + "/tankHeight.json";
+
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+    String payload = http.getString();
+    payload.trim();
+
+    float value = payload.toFloat();
+    if (value > 0) {
+      tankHeightCm = value;
+      Serial.print("Tank Height loaded: ");
+      Serial.println(tankHeightCm);
+    }
+  }
+
+  http.end();
+}
+
+
+// -------------------------------------------------
+// دالة مساعدة: إرسال alert إلى Realtime Database
+// -------------------------------------------------
+void sendAlertToFirebase(const String& type, const String& message) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Alert: No WiFi, can't send alert");
+    return;
+  }
+
+  HTTPClient http;
+
+  // alertId بسيط مبني على millis() (تقدر تغيّره لو حاب)
+  String alertId = String(millis());
+
+  String url = String(firebaseHost) +
+               "devices/" + deviceId +
+               "/alerts/" + alertId + ".json";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  String json = "{";
+  json += "\"type\":\""    + type    + "\",";
+  json += "\"message\":\"" + message + "\",";
+  json += "\"timestamp\":" + String(millis());
+  json += "}";
+
+  Serial.println("SEND ALERT:");
+  Serial.println(json);
+
+  int httpCode = http.PUT(json);
+  if (httpCode > 0) {
+    Serial.print("Alert HTTP code: ");
+    Serial.println(httpCode);
+  } else {
+    Serial.print("Alert HTTP error: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
+}
+
+// -------------------------------------------------
+// SETUP
+// -------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(SOIL_PIN, INPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(PUMP_PIN, OUTPUT);
+
+  // الريليه Active LOW → HIGH يعني المضخة طافية
+  digitalWrite(PUMP_PIN, HIGH);
+
+  // LCD
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.print("Smart Garden");
+
+  // واي فاي عبر WiFiManager
+  WiFi.mode(WIFI_STA);
+  WiFiManager wm;
+  lcd.clear();
+  lcd.print("WiFi Config...");
+  bool res = wm.autoConnect("SmartGarden-Config", "12345678");
+
+  if (!res) {
+    Serial.println("❌ WiFi Failed");
+    lcd.clear();
+    lcd.print("WiFi Failed");
+  } else {
+    Serial.println("✅ WiFi Connected");
+    lcd.clear();
+    lcd.print("WiFi OK");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP().toString().c_str());
+    delay(1500);
+  }
+  readTankHeightFromFirebase();
+
+  // أول طلب للطقس
+  getWeatherForecast();
+}
+
+// -------------------------------------------------
+// LOOP
+// -------------------------------------------------
+void loop() {
+
+  unsigned long now = millis();
+  if (millis() - lastTankHeightRead > 60000) {
+  readTankHeightFromFirebase();
+  lastTankHeightRead = now;
+}
+
+  readRemotePumpCommand();
+  if (now - lastWeatherTime > weatherInterval) {
+    getWeatherForecast();
+    lastWeatherTime = now;
+  }
+
+  int   soilRaw      = analogRead(SOIL_PIN);
+  float waterPercent = getWaterLevelPercent();
+
+  // منطق تشغيل المضخة (يوقفها لو فيه pipeError أو pumpStuckError)
+  controlPump(soilRaw, waterPercent);
+
+  // مراقبة الأنابيب والمضخة (تهريب + مضخة عالقة + ري طبيعي)
+  monitorPumpAndPipes(soilRaw, waterPercent);
+
+  // مراقبة مستوى الماء المنخفض → low_water
+  checkLowWaterAlert(waterPercent);
+
+  // عرض البيانات
+  showOnSerial(soilRaw, waterPercent);
+  showOnLCD(soilRaw, waterPercent);
+
+  bool pumpOn = (digitalRead(PUMP_PIN) == LOW);
+  sendDataToFirebase(soilRaw, waterPercent, pumpOn);
+
+  delay(1000);
+}
+
+// ===== حساب نسبة المياه في الخزان =====
+float getWaterLevelPercent() {
+  if (tankHeightCm <= 0) return 0;
+
+  const int samples = 5;
+  float totalDistance = 0;
+  int validReadings = 0;
+
+  for (int i = 0; i < samples; i++) {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+
+    long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+    if (duration > 0) {
+      float distance = duration * 0.0343 / 2.0;
+
+      // 👇 تساهل منطقي بدل الرفض الكامل
+      if (distance > 2 && distance < 500) {
+        totalDistance += distance;
+        validReadings++;
+      }
+    }
+
+    delay(50);
+  }
+
+  if (validReadings == 0) return 0;
+
+  float avgDistance = totalDistance / validReadings;
+
+  float waterHeight = tankHeightCm - avgDistance;
+
+  // حماية
+  waterHeight = constrain(waterHeight, 0, tankHeightCm);
+
+  return (waterHeight / tankHeightCm) * 100.0;
+}
+
+
+// ===== منطق تشغيل المضخة + إشعار تخطي الري بسبب المطر =====
+void controlPump(int soilRaw, float waterPercent) {
+  if (pipeError || pumpStuckError) {
+    digitalWrite(PUMP_PIN, HIGH);
+    return;
+  }
+
+  if (remotePumpOn) {
+    Serial.println("🔧 Manual Command: Pump ON from app");
+    digitalWrite(PUMP_PIN, LOW);  // ON (Active LOW)
+    return;
+  }
+
+  Serial.print("DEBUG Pump: rain=");
+  Serial.print(isRainExpected);
+  Serial.print(" water=");
+  Serial.print(waterPercent);
+  Serial.print(" soil=");
+  Serial.println(soilRaw);
+
+  // شرط أن التربة جافة والماء كافي
+  bool soilNeedsWater = (soilRaw == 4095);
+  bool enoughWater    = (waterPercent > 20.0);
+
+  // لو كان المفروض نسقي لكن في مطر متوقع → نوقف الري + نرسل إشعار skip_rain
+  if (soilNeedsWater && enoughWater && isRainExpected) {
+    digitalWrite(PUMP_PIN, HIGH); // لا نسقي
+
+    if (!rainSkipAlertSent) {
+      sendAlertToFirebase("skip_rain",
+                          "تم تخطي الري بسبب توقع هطول الأمطار.");
+      rainSkipAlertSent = true;
+    }
+  } else {
+    // نعيد السماح للإشعار في المستقبل عندما تتغيّر الظروف
+    rainSkipAlertSent = false;
+
+    // في حالة عدم وجود مطر متوقع والشرط متحقق → شغّل المضخة
+    if (!isRainExpected && enoughWater && soilNeedsWater) {
+      Serial.println("✅ شرط تشغيل المضخة تحقق");
+      digitalWrite(PUMP_PIN, LOW);
+    } else {
+      digitalWrite(PUMP_PIN, HIGH);
+    }
+  }
+}
+
+// ===== مراقبة التهريب + المضخة العالقة + الري الطبيعي =====
+void monitorPumpAndPipes(int soilRaw, float waterPercent) {
+  bool pumpOn = (digitalRead(PUMP_PIN) == LOW); // Active LOW
+  bool wasPumpOn = lastPumpOn;
+
+  // إذا المضخة اشتغلت الآن (تغيّرت من OFF → ON)
+  if (pumpOn && !wasPumpOn) {
+    pumpOnStartTime = millis();
+    soilAtPumpStart  = soilRaw;
+    waterAtPumpStart = waterPercent;
+    pipeError        = false;  // نعيد التهيئة لهذا التشغيل
+    pumpStuckError   = false;
+    irrigationInProgress = true;
+
+    Serial.println("🔹 المضخة اشتغلت - بدء مراقبة الصحة...");
+  }
+
+  // إذا المضخة شغّالة ولم يتم تسجيل خطأ بعد
+  if (pumpOn && !pipeError && !pumpStuckError) {
+    unsigned long elapsed = millis() - pumpOnStartTime;
+
+    if (elapsed >= PUMP_HEALTH_CHECK_TIME) {
+      float waterDrop = waterAtPumpStart - waterPercent;
+
+      Serial.print("⏱ فحص بعد ");
+      Serial.print(elapsed / 1000);
+      Serial.println(" ثانية");
+      Serial.print("نزول الماء: ");
+      Serial.println(waterDrop);
+      Serial.print("قراءة التربة الحالية: ");
+      Serial.println(soilRaw);
+
+      // ---- 1) تهريب / قطع أنابيب (Leak) ----
+      // الماء نقص كثير لكن التربة ما زالت جافة جداً
+      if (waterDrop > MIN_WATER_DROP_FOR_FLOW && soilRaw >= SOIL_DRY_THRESHOLD) {
+        pipeError = true;
+        digitalWrite(PUMP_PIN, HIGH); // طفي المضخة
+
+        Serial.println("❌ Pipe Error: احتمال تهريب/قطع في الانابيب");
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Pipe Error!");
+        lcd.setCursor(0, 1);
+        lcd.print("Check Pipes");
+        delay(2000);
+
+        // إشعار pipe_error
+        sendAlertToFirebase("pipe_error",
+                            "تم اكتشاف مشكلة في الأنابيب، يرجى فحص نظام الري.");
+      }
+      // ---- 2) مضخة عالقة (Pump Stuck) ----
+      // الماء ما نقص تقريباً والتربة ما زالت جافة
+      else if (waterDrop < MAX_WATER_DROP_FOR_STUCK && soilRaw >= SOIL_DRY_THRESHOLD) {
+        pumpStuckError = true;
+        digitalWrite(PUMP_PIN, HIGH); // طفي المضخة
+
+        Serial.println("❌ Pump Error: المضخة لا تضخ ماء (عالقة؟)");
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Pump Error!");
+        lcd.setCursor(0, 1);
+        lcd.print("Check Pump");
+        delay(2000);
+
+        // إشعار pump_error
+        sendAlertToFirebase("pump_error",
+                            "تم اكتشاف مشكلة في المضخة، يرجى فحصها.");
+      }
+      // لو لا هذا ولا هذا → الأمور طبيعية (إما تربة بدأت تبتل أو نقص الماء منطقي)
+    }
+  }
+
+  // إذا المضخة طُفِئت الآن (تغيّرت من ON → OFF)
+  if (!pumpOn && wasPumpOn) {
+    // لو دورة الري انتهت بدون أخطاء → اعتبره ري طبيعي
+    if (irrigationInProgress && !pipeError && !pumpStuckError) {
+      Serial.println("✅ Irrigation finished normally.");
+      sendAlertToFirebase("normal_irrigation",
+                          "تم تنفيذ عملية الري بشكل طبيعي.");
+    }
+    irrigationInProgress = false;
+  }
+
+  // تحديث حالة المضخة السابقة
+  lastPumpOn = pumpOn;
+}
+
+// ===== مراقبة مستوى الماء المنخفض =====
+void checkLowWaterAlert(float waterPercent) {
+  // إذا الماء أقل أو يساوي 20% ولم نرسل إشعار من قبل → أرسل low_water
+  if (waterPercent <= 20.0 && !lowWaterAlertSent) {
+    sendAlertToFirebase("low_water",
+                        "مستوى الماء في الخزان منخفض، يرجى إعادة تعبئته.");
+    lowWaterAlertSent = true;
+  }
+
+  // إذا رجع مستوى الماء أعلى من 30% → يسمح بإرسال إشعار جديد في المستقبل
+  if (waterPercent > 30.0) {
+    lowWaterAlertSent = false;
+  }
+}
+
+// ===== عرض في Serial =====
+void showOnSerial(int soilRaw, float waterPercent) {
+  bool pumpOn = (digitalRead(PUMP_PIN) == LOW);
+
+  Serial.println("===== بيانات النظام =====");
+  Serial.print("قراءة التربة: "); Serial.println(soilRaw);
+  Serial.print("نسبة الماء: "); Serial.println(waterPercent);
+  Serial.print("حرارة متوقعة: "); Serial.println(forecastTemp);
+  Serial.print("وصف الطقس: "); Serial.println(forecastDesc);
+  Serial.print("مطر متوقع؟ "); Serial.println(isRainExpected ? "نعم" : "لا");
+  Serial.print("حالة المضخة: "); Serial.println(pumpOn ? "تشغيل" : "إيقاف");
+  Serial.print("Pipe Error: "); Serial.println(pipeError ? "نعم" : "لا");
+  Serial.print("Pump Stuck: "); Serial.println(pumpStuckError ? "نعم" : "لا");
+  Serial.print("Water %: ");
+Serial.println(waterPercent);
+
+  Serial.println("=========================\n");
+}
+
+// ===== عرض على LCD =====
+void showOnLCD(int soilRaw, float waterPercent) {
+  // لو فيه خطأ أنابيب
+  if (pipeError) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Pipe Error!");
+    lcd.setCursor(0, 1);
+    lcd.print("Check Pipes");
+    return;
+  }
+
+  // لو فيه خطأ مضخة
+  if (pumpStuckError) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Pump Error!");
+    lcd.setCursor(0, 1);
+    lcd.print("Check Pump");
+    return;
+  }
+
+  // عرض عادي
+  lcd.clear();
+
+  // السطر الأول: Soil + Water
+  lcd.setCursor(0, 0);
+  lcd.print("S:");
+  lcd.print(soilRaw);
+  lcd.print(" W:");
+  lcd.print((int)waterPercent);
+  lcd.print("%");
+
+  // السطر الثاني: Temp + Rain/NoRain
+  lcd.setCursor(0, 1);
+  lcd.print("T:");
+  lcd.print(forecastTemp, 0);
+  lcd.print("C ");
+
+  if (isRainExpected)
+    lcd.print("Rain");
+  else
+    lcd.print("NoRan");
+}
+// ===== إرسال بيانات النظام إلى Firebase =====
+void sendDataToFirebase(int soilRaw, float waterPercent, bool pumpOn) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Firebase: No WiFi");
+    return;
+  }
+
+  HTTPClient http;
+
+  // نفس المسار مثل قبل: devices/esp01.json
+  String url = String(firebaseHost) + "devices/" + deviceId + ".json";
+  http.begin(url);
+
+  http.addHeader("Content-Type", "application/json");
+
+  // هذا الـ JSON ما فيه alerts (بس الحساسات والحالة)
+  String json = "{";
+  json += "\"soilRaw\":" + String(soilRaw) + ",";
+  json += "\"waterPercent\":" + String(waterPercent, 1) + ",";
+  if (tankHeightCm > 0) {
+    json += "\"tankHeight\":" + String(tankHeightCm, 1) + ",";
+}
+  json += "\"forecastTemp\":" + String(forecastTemp, 1) + ",";
+  json += "\"forecastHum\":" + String(forecastHum) + ",";
+  json += "\"isRainExpected\":" + String(isRainExpected ? "true" : "false") + ",";
+  json += "\"pipeError\":" + String(pipeError ? "true" : "false") + ",";
+  json += "\"pumpStuckError\":" + String(pumpStuckError ? "true" : "false") + ",";
+  json += "\"pumpOn\":" + String(pumpOn ? "true" : "false") + ",";
+  json += "\"remotePumpOn\":" + String(remotePumpOn ? "true" : "false") + ",";
+  json += "\"timestamp\":" + String(millis());
+  json += "}";
+
+  Serial.println("Firebase SEND (PATCH):");
+  Serial.println(json);
+
+  // 🔴 قبل: PUT يمسح أي أطفال آخرين
+  // int httpCode = http.PUT(json);
+
+  // ✅ الآن: PATCH → يحدّث فقط هذه المفاتيح ويترك alerts كما هي
+  int httpCode = http.sendRequest("PATCH", json);
+
+  if (httpCode > 0) {
+    Serial.print("Firebase code: ");
+    Serial.println(httpCode);
+  } else {
+    Serial.print("Firebase error: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
+}
+
+void readRemotePumpCommand() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = String(firebaseHost) + "devices/" + deviceId + "/remotePumpOn.json";
+
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+    String payload = http.getString();
+    payload.trim();
+    Serial.print("RemotePumpOn payload: ");
+    Serial.println(payload);
+
+    if (payload == "true") {
+      remotePumpOn = true;
+    } else if (payload == "false" || payload == "null") {
+      remotePumpOn = false;
+    }
+  } else {
+    Serial.print("Error reading remotePumpOn: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
+}
+// ===== طلب الطقس من OpenWeather =====
+void getWeatherForecast() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String url =
+    "http://api.openweathermap.org/data/2.5/forecast?lat=" +
+    String(latitude) +
+    "&lon=" + String(longitude) +
+    "&appid=" + apiKey +
+    "&units=metric&lang=ar";
+
+  HTTPClient http;
+  http.begin(url);
+
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(16384);
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error) {
+      Serial.print("JSON Error: ");
+      Serial.println(error.c_str());
+      http.end();
+      return;
+    }
+
+    JsonObject item = doc["list"][0];
+    forecastTemp = item["main"]["temp"];
+    forecastHum  = item["main"]["humidity"];
+
+    const char* mainWeather = item["weather"][0]["main"];
+    const char* desc        = item["weather"][0]["description"];
+
+    forecastDesc = desc;
+
+    if (strcmp(mainWeather, "Rain") == 0 ||
+        strcmp(mainWeather, "Drizzle") == 0 ||
+        strcmp(mainWeather, "Thunderstorm") == 0)
+      isRainExpected = true;
+    else
+      isRainExpected = false;
+  } else {
+    Serial.print("Weather HTTP Error: ");
+    Serial.println(httpCode);
+  }
+
+  http.end();
+}

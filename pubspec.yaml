@@ -1,0 +1,57 @@
+name: smart_garden
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.8.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  firebase_core: ^3.0.0
+  firebase_auth: ^5.0.0
+  cloud_firestore: ^5.0.0
+  google_sign_in: ^6.1.5
+  http: ^1.2.0
+  firebase_database: ^11.3.10
+  firebase_messaging: ^15.2.10
+  image_picker: ^1.1.2
+  firebase_storage: ^12.3.7
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  flutter_launcher_icons: ^0.13.1
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/images/google_logo.png
+    - assets/images/email_logo.png
+    - assets/images/lock_logo.png
+    - assets/images/leaf_photo.png
+    - assets/images/flower.png
+    - assets/images/water.png
+    - assets/images/flower1.png
+    - assets/images/sea.png
+    - assets/images/flower2.png
+    - assets/images/code_logo.png
+    - assets/images/grass.png
+    - assets/images/home_icon.png
+    - assets/images/ai_icon.png
+    - assets/images/prof_icon.png
+    - assets/images/pump_tap.png
+    - assets/images/photo_icon.png
+
+
+flutter_icons:
+  android: true
+  ios: true
+  image_path: "assets/icons/llllll.png"
