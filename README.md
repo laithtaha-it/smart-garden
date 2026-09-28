@@ -1,5 +1,9 @@
 # Smart Garden
 
+> **Developed by [Laith Taha (laithtaha-it)](https://github.com/laithtaha-it)**
+
+---
+
 Smart Garden is a Flutter-based smart irrigation system that connects an Android application with an ESP32-controlled garden system.
 
 The system combines real-time sensor monitoring, automatic and manual irrigation control, weather-based irrigation decisions, Firebase services, push notifications, and AI-based plant disease analysis.
